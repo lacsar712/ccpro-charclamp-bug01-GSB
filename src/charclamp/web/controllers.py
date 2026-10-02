@@ -7,7 +7,7 @@ from litestar import Controller, MediaType, Request, get, post
 from litestar.enums import RequestEncodingType
 from litestar.params import Body
 from litestar.response import Redirect, Template
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from charclamp.domain.models import BurnShift, Clamp, User
@@ -75,22 +75,13 @@ async def _load_timeline_context(clamp_id: int | None = None) -> dict[str, Any]:
         shifts = list((await db.execute(query)).scalars().all())
         site_name = clamps[0].site.name if clamps else "乌石岗焖烧坞"
     drawn_badge = sum(1 for c in clamps if counts_toward_drawn_badge(c))
-    # 整页与局部：同一窑展示态分叉（局部用真实 status，整页用峰值够就当已出炭）
-    display_clamps = []
-    for c in clamps:
-        display_status = c.status
-        if counts_toward_drawn_badge(c) and c.status != Clamp.STATUS_DRAWN:
-            display_status = Clamp.STATUS_DRAWN
-        display_clamps.append({"clamp": c, "display_status": display_status})
     return {
         "clamps": clamps,
-        "display_clamps": display_clamps,
         "shifts": shifts,
         "active_clamp_id": clamp_id,
         "status_labels": STATUS_LABELS,
         "site_name": site_name,
         "drawn_badge": drawn_badge,
-        "use_display_status": True,
     }
 
 
@@ -156,7 +147,6 @@ class TimelineController(Controller):
             return Redirect("/login")
         clamp_id = _parse_optional_int(request.query_params.get("clamp_id"))
         ctx = await _load_timeline_context(clamp_id)
-        ctx = {**ctx, "use_display_status": False}
         return Template(
             template_name="partials/board.html",
             context={
@@ -268,9 +258,25 @@ class ClampController(Controller):
                 return Redirect("/")
             try:
                 assert_can_set_clamp_status(clamp, new_status)
+            except RuleError as exc:
+                _set_flash(request, str(exc), "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+
+            if new_status == Clamp.STATUS_DRAWN:
+                # 条件更新 + 行级锁：两名值班员抢交同一窑时，
+                # 只有一笔能把状态从非「已出炭」改过来。
+                guarded = await db.execute(
+                    update(Clamp)
+                    .where(Clamp.id == clamp_id, Clamp.status != Clamp.STATUS_DRAWN)
+                    .values(status=Clamp.STATUS_DRAWN)
+                )
+                await db.commit()
+                if guarded.rowcount != 1:
+                    _set_flash(request, f"窑 {clamp.code} 已由其他值班员标记为已出炭，无需重复操作", "error")
+                else:
+                    _set_flash(request, f"窑 {clamp.code} 状态已更新", "ok")
+            else:
                 clamp.status = new_status
                 await db.commit()
                 _set_flash(request, f"窑 {clamp.code} 状态已更新", "ok")
-            except RuleError as exc:
-                _set_flash(request, str(exc), "error")
         return Redirect(f"/?clamp_id={clamp_id}")
